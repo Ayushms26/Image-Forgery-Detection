@@ -1,109 +1,141 @@
-import os
+import cv2
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, models, applications
+from tensorflow.keras import layers, models
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, f1_score, roc_auc_score
-import cv2
+from sklearn.metrics import roc_auc_score, f1_score
+import matplotlib.pyplot as plt
+from flask import Flask, request, jsonify
+import io
 
-# 1. High-Resolution Image Loader (No Downscaling)
-def load_highres_images(folder, label, target_size=None):
-    images, labels = [], []
-    for filename in os.listdir(folder)[:500]:
-        img_path = os.path.join(folder, filename)
-        img = cv2.imread(img_path)
-        if img is not None:
-            if target_size:  # Optional resizing (not used here)
-                img = cv2.resize(img, target_size)
-            img = img.astype('float32') / 255.0
-            images.append(img)
-            labels.append(label)
-    return np.array(images), np.array(labels)
+# ======================
+# CNN Model Architecture
+# ======================
 
-# 2. Load CASIA v2 and CoMoFoD - Splicing + Copy-Move Forgeries
-def load_datasets(casia_path, comofod_path):
-    casia_auth, y_casia_auth = load_highres_images(f'{casia_path}/Au', 0)
-    casia_forged, y_casia_forged = load_highres_images(f'{casia_path}/Tp', 1)
-    
-    comofod_auth, y_como_auth = load_highres_images(f'{comofod_path}/original', 0)
-    comofod_forged, y_como_forged = load_highres_images(f'{comofod_path}/forged', 1)
-    
-    # Combine
-    X = np.concatenate((casia_auth, casia_forged, comofod_auth, comofod_forged))
-    y = np.concatenate((y_casia_auth, y_casia_forged, y_como_auth, y_como_forged))
-    
-    return train_test_split(X, y, test_size=0.2, random_state=42)
-
-# 3. EfficientNet-Based CNN without ELA
-def build_high_acc_model(input_shape):
-    base_model = applications.EfficientNetB3(
-        include_top=False,
-        weights='imagenet',
-        input_shape=input_shape
-    )
-    base_model.trainable = False  # Use pretrained features
-    
+def create_forgery_detection_model(input_shape=(512, 512, 3)):
     model = models.Sequential([
-        base_model,
+        # Feature Extraction Backbone
+        layers.Conv2D(32, (7,7), activation='relu', input_shape=input_shape),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2,2)),
+        
+        layers.Conv2D(64, (5,5), activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2,2)),
+        
+        layers.Conv2D(128, (3,3), activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2,2)),
+        
+        # Attention Mechanism
+        layers.Conv2D(1, (1,1), activation='sigmoid'),
+        layers.Multiply(),
+        
+        # Classification Head
         layers.GlobalAveragePooling2D(),
         layers.Dense(256, activation='relu'),
         layers.Dropout(0.5),
         layers.Dense(1, activation='sigmoid')
     ])
     
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
-        loss='binary_crossentropy',
-        metrics=['accuracy']
-    )
+    model.compile(optimizer='adam',
+                  loss='binary_crossentropy',
+                  metrics=['accuracy', 
+                           tf.keras.metrics.AUC(name='roc_auc')])
     return model
 
-# 4. Evaluation: Accuracy, F1, ROC-AUC
-def full_evaluation(model, X_test, y_test):
-    y_pred = model.predict(X_test)
-    y_pred_labels = (y_pred > 0.5).astype(int)
+# ====================
+# Grad-CAM Implementation
+# ====================
 
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred_labels))
-
-    f1 = f1_score(y_test, y_pred_labels)
-    roc_auc = roc_auc_score(y_test, y_pred)
-
-    print(f"\nF1 Score: {f1:.4f}")
-    print(f"ROC AUC: {roc_auc:.4f}")
-    
-    return f1, roc_auc
-
-# 5. Main Execution Pipeline
-def main():
-    CASIA_PATH = 'path/to/CASIAv2'
-    COMOFOD_PATH = 'path/to/CoMoFoD'
-
-    print("\n[INFO] Loading high-resolution datasets...")
-    X_train, X_test, y_train, y_test = load_datasets(CASIA_PATH, COMOFOD_PATH)
-
-    input_shape = X_train[0].shape
-    print(f"[INFO] Training on image shape: {input_shape}")
-
-    print("\n[INFO] Building model architecture...")
-    model = build_high_acc_model(input_shape)
-
-    print("\n[INFO] Starting model training...")
-    model.fit(
-        X_train, y_train,
-        validation_data=(X_test, y_test),
-        epochs=15,
-        batch_size=16
+def generate_gradcam(model, img_array, layer_name='conv2d_2'):
+    grad_model = tf.keras.models.Model(
+        [model.inputs], [model.get_layer(layer_name).output, model.output]
     )
+    
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        class_idx = tf.argmax(predictions[0])
+        loss = predictions[:, class_idx]
+    
+    grads = tape.gradient(loss, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap).numpy()
+    
+    heatmap = cv2.resize(heatmap, (img_array.shape[2], img_array.shape[1]))
+    heatmap = np.maximum(heatmap, 0)
+    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min())
+    
+    return heatmap
 
-    print("\n[INFO] Evaluating performance...")
-    f1, roc_auc = full_evaluation(model, X_test, y_test)
+# ====================
+# Flask API
+# ====================
 
-    if f1 >= 0.94 and roc_auc >= 0.96:
-        model.save("forgery_detector.h5")
-        print("\n[SUCCESS] Model saved successfully with target performance achieved.")
-    else:
-        print("\n[WARNING] Model did not meet all target metrics.")
+app = Flask(__name__)
+model = create_forgery_detection_model()
+model.load_weights('forgery_detection_model.h5')  # Pretrained weights
+
+@app.route('/detect', methods=['POST'])
+def detect_forgery():
+    file = request.files['image'].read()
+    img = cv2.imdecode(np.frombuffer(file, np.uint8), cv2.IMREAD_COLOR)
+    img = cv2.resize(img, (512, 512))  # Model input size
+    img_array = np.expand_dims(img/255.0, axis=0)
+    
+    # Prediction
+    prediction = model.predict(img_array)[0][0]
+    
+    # Explainability
+    heatmap = generate_gradcam(model, img_array)
+    _, heatmap_img = cv2.threshold(heatmap, 0.5, 255, cv2.THRESH_BINARY)
+    
+    # Save visualization
+    plt.imshow(img)
+    plt.imshow(heatmap, alpha=0.5)
+    plt.savefig('heatmap.png')
+    
+    return jsonify({
+        'authenticity': float(1 - prediction),
+        'tamper_confidence': float(prediction),
+        'heatmap': 'heatmap.png'
+    })
+
+# ====================
+# Training Pipeline
+# ====================
+
+def train_model(dataset_path, epochs=20):
+    # Load dataset (CASIA v2/CoMoFoD structure)
+    authentic_imgs = load_images(f'{dataset_path}/authentic')
+    forged_imgs = load_images(f'{dataset_path}/forged')
+    
+    X = np.concatenate([authentic_imgs, forged_imgs])
+    y = np.array([0]*len(authentic_imgs) + [1]*len(forged_imgs))
+    
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+    
+    # Model training
+    model = create_forgery_detection_model()
+    history = model.fit(X_train, y_train,
+                        validation_data=(X_test, y_test),
+                        epochs=epochs)
+    
+    # Evaluation
+    y_pred = model.predict(X_test)
+    print(f"F1 Score: {f1_score(y_test, y_pred > 0.5):.2f}")
+    print(f"ROC AUC: {roc_auc_score(y_test, y_pred):.2f}")
+    
+    # Save model
+    model.save('forgery_detection_model.h5')
 
 if __name__ == '__main__':
-    main()
+    # Train model
+    # train_model('/path/to/dataset')
+    
+    # Start Flask app
+    app.run(port=5000, threaded=False)
